@@ -25,6 +25,5 @@ results/
 examples/data*
 examples/download*
 examples/exp*/
-.claude/
 *.wav
 *.jsonl
