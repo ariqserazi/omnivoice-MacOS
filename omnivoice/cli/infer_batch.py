@@ -42,11 +42,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Optional, Tuple
 
 import torch
-import torchaudio
 from tqdm import tqdm
 
 from omnivoice.models.omnivoice import OmniVoice
-from omnivoice.utils.audio import load_audio
+from omnivoice.utils.audio import load_audio, save_audio_file_any
 from omnivoice.utils.common import str2bool
 from omnivoice.utils.data_utils import read_test_list
 from omnivoice.utils.duration import RuleDurationEstimator
@@ -385,7 +384,7 @@ def run_inference_batch(
     results = []
     for save_name, audio in zip(save_names, audios):
         save_path = os.path.join(res_dir, save_name + ".wav")
-        torchaudio.save(save_path, audio, worker_model.sampling_rate)
+        save_audio_file_any(save_path, audio, worker_model.sampling_rate)
         audio_duration = audio.shape[-1] / worker_model.sampling_rate
         results.append(
             (

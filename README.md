@@ -107,6 +107,12 @@ Try OmniVoice without coding:
 
 - Launch the local web UI: `omnivoice-demo --device auto --ip 0.0.0.0 --port 8001`
 
+- Or use the one-command local launcher from the repo root:
+
+```bash
+./run_omnivoice_demo.sh
+```
+
 - Create a reusable saved voice from the CLI:
 
 ```bash
@@ -147,7 +153,7 @@ Clone a voice from a short reference audio. Provide `ref_audio` and `ref_text`:
 ```python
 from omnivoice import OmniVoice
 import torch
-import torchaudio
+import soundfile as sf
 
 model = OmniVoice.from_pretrained(
     "k2-fsa/OmniVoice",
@@ -165,7 +171,7 @@ audio = model.generate(
 # If you don't want to input `ref_text` manually, you can directly omit the `ref_text`.
 # The model will use Whisper ASR to auto-transcribe it.
 
-torchaudio.save("out.wav", audio[0], 24000)
+sf.write("out.wav", audio[0].squeeze(0).cpu().numpy(), 24000)
 ```
 
 > **Tips**

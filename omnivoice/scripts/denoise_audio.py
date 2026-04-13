@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
 import webdataset as wds
@@ -370,7 +371,7 @@ def serialise_flac(key: str, waveform: torch.Tensor, sample_rate: int) -> dict:
     audio = waveform.to(dtype=torch.float32).cpu()
     if audio.ndim == 1:
         audio = audio.unsqueeze(0)
-    torchaudio.save(buffer, audio, sample_rate, format="flac", bits_per_sample=16)
+    sf.write(buffer, audio.transpose(0, 1).numpy(), sample_rate, format="FLAC")
     return {"__key__": key, "flac": buffer.getvalue()}
 
 

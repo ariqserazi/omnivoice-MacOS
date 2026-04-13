@@ -7,9 +7,8 @@ import json
 import logging
 from dataclasses import asdict
 
-import torchaudio
-
 from omnivoice.models.omnivoice import OmniVoiceGenerationConfig
+from omnivoice.utils.audio import save_audio_file_any
 from omnivoice.utils.runtime import load_model_runtime, run_backend_sanity_check
 from omnivoice.utils.voice_profiles import VoiceLibrary
 
@@ -182,7 +181,7 @@ def main(argv=None) -> int:
             duration=args.duration,
             generation_config=config,
         )[0]
-        torchaudio.save(args.output, audio, model.sampling_rate)
+        save_audio_file_any(args.output, audio, model.sampling_rate)
         print(args.output)
         return 0
 

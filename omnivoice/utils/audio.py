@@ -28,6 +28,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 import numpy as np
+import soundfile as sf
 import torch
 import torchaudio
 from pydub import AudioSegment
@@ -51,6 +52,50 @@ class ReferenceAudioReport:
         return asdict(self)
 
 
+def _numpy_audio_to_tensor(audio_data: np.ndarray) -> torch.Tensor:
+    if audio_data.ndim == 1:
+        return torch.from_numpy(audio_data.astype(np.float32)).unsqueeze(0)
+    return torch.from_numpy(audio_data.astype(np.float32).T)
+
+
+def save_audio_file_any(audio_path: str, waveform: torch.Tensor, sample_rate: int) -> None:
+    """Save audio without requiring torchcodec."""
+    audio = waveform.detach().cpu().float()
+    if audio.dim() == 2 and audio.shape[0] == 1:
+        data = audio.squeeze(0).numpy()
+    elif audio.dim() == 2:
+        data = audio.transpose(0, 1).numpy()
+    else:
+        data = audio.numpy()
+    sf.write(audio_path, data, sample_rate)
+
+
+def load_audio_file_any(audio_path: str) -> tuple[torch.Tensor, int]:
+    """Load audio without requiring torchcodec."""
+    errors = []
+    try:
+        audio_data, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
+        return _numpy_audio_to_tensor(audio_data), int(sample_rate)
+    except Exception as exc:
+        errors.append(f"soundfile: {exc}")
+
+    try:
+        aseg = AudioSegment.from_file(audio_path)
+    except Exception as exc:
+        errors.append(f"pydub: {exc}")
+        raise RuntimeError(
+            f"Unable to load audio file {audio_path!r} without torchcodec. "
+            + " ; ".join(errors)
+        ) from exc
+
+    audio_data = np.array(aseg.get_array_of_samples()).astype(np.float32)
+    max_int = float(1 << (8 * aseg.sample_width - 1))
+    audio_data = audio_data / max_int
+    if aseg.channels > 1:
+        audio_data = audio_data.reshape(-1, aseg.channels)
+    return _numpy_audio_to_tensor(audio_data), int(aseg.frame_rate)
+
+
 def load_audio(audio_path: str, sampling_rate: int):
     """
     Load the waveform with torchaudio and resampling if needed.
@@ -63,19 +108,7 @@ def load_audio(audio_path: str, sampling_rate: int):
         Loaded prompt waveform with target sampling rate,
         PyTorch tensor of shape (1, T)
     """
-    try:
-        waveform, prompt_sampling_rate = torchaudio.load(
-            audio_path, backend="soundfile"
-        )
-    except (RuntimeError, OSError):
-        # Fallback via pydub+ffmpeg for formats torchaudio can't handle
-        aseg = AudioSegment.from_file(audio_path)
-        audio_data = np.array(aseg.get_array_of_samples()).astype(np.float32) / 32768.0
-        if aseg.channels == 1:
-            waveform = torch.from_numpy(audio_data).unsqueeze(0)
-        else:
-            waveform = torch.from_numpy(audio_data.reshape(-1, aseg.channels).T)
-        prompt_sampling_rate = aseg.frame_rate
+    waveform, prompt_sampling_rate = load_audio_file_any(audio_path)
 
     if prompt_sampling_rate != sampling_rate:
         waveform = torchaudio.functional.resample(
@@ -156,19 +189,8 @@ def preprocess_reference_audio(
     warnings: list[str] = []
 
     if isinstance(ref_audio, str):
-        try:
-            raw_waveform, original_sr = torchaudio.load(ref_audio, backend="soundfile")
-        except (RuntimeError, OSError):
-            aseg = AudioSegment.from_file(ref_audio)
-            audio_data = np.array(aseg.get_array_of_samples()).astype(np.float32) / 32768.0
-            if aseg.channels == 1:
-                raw_waveform = torch.from_numpy(audio_data).unsqueeze(0)
-            else:
-                raw_waveform = torch.from_numpy(audio_data.reshape(-1, aseg.channels).T)
-            original_sr = aseg.frame_rate
-            operations.append("loaded audio through ffmpeg fallback")
-        else:
-            operations.append("loaded audio from file")
+        raw_waveform, original_sr = load_audio_file_any(ref_audio)
+        operations.append("loaded audio from file")
     else:
         raw_waveform, original_sr = ref_audio
         if raw_waveform.dim() == 1:

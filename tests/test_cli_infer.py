@@ -43,7 +43,7 @@ def test_infer_uses_saved_voice_profile(monkeypatch, tmp_path):
         ),
     )
     saved_paths = []
-    monkeypatch.setattr("omnivoice.cli.infer.torchaudio.save", lambda path, audio, sr: saved_paths.append((path, sr)))
+    monkeypatch.setattr("omnivoice.cli.infer.save_audio_file_any", lambda path, audio, sr: saved_paths.append((path, sr)))
 
     infer.main(
         [

@@ -14,9 +14,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 import torch
-import torchaudio
 
 from omnivoice.models.omnivoice import VoiceClonePrompt
+from omnivoice.utils.audio import load_audio_file_any, save_audio_file_any
 from omnivoice.utils.app_paths import get_voice_library_dir
 
 SCHEMA_VERSION = 1
@@ -93,7 +93,7 @@ class VoiceLibrary:
         profile_dir = self._profile_dir(profile_id)
         profile_dir.mkdir(parents=True, exist_ok=False)
 
-        torchaudio.save(str(self._audio_path(profile_id)), cleaned_audio.cpu(), sample_rate)
+        save_audio_file_any(str(self._audio_path(profile_id)), cleaned_audio, sample_rate)
         torch.save(
             {
                 "ref_audio_tokens": prompt.ref_audio_tokens.cpu(),
@@ -155,7 +155,7 @@ class VoiceLibrary:
 
     def load_reference_audio(self, name_or_id: str) -> tuple[torch.Tensor, int]:
         profile = self.find_profile(name_or_id)
-        return torchaudio.load(str(self._audio_path(profile.id)))
+        return load_audio_file_any(str(self._audio_path(profile.id)))
 
     def rename_profile(self, name_or_id: str, new_name: str) -> VoiceProfile:
         profile = self.find_profile(name_or_id)

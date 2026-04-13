@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import time
@@ -12,6 +13,7 @@ from typing import Any
 
 import gradio as gr
 import numpy as np
+import torch
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.utils.backend import available_backends
@@ -20,6 +22,12 @@ from omnivoice.utils.runtime import load_model_runtime
 from omnivoice.utils.voice_profiles import VoiceLibrary
 
 logger = logging.getLogger(__name__)
+
+APP_THEME = gr.themes.Soft(font=["IBM Plex Sans", "Avenir Next", "sans-serif"])
+APP_CSS = """
+.gradio-container {max-width: 1280px !important; font-size: 16px !important;}
+.hero {background: linear-gradient(135deg, #eef6ff, #f5f1e8); border-radius: 20px; padding: 20px;}
+"""
 
 _ALL_LANGUAGES = ["Auto"] + sorted(lang_display_name(n) for n in LANG_NAMES)
 
@@ -85,6 +93,16 @@ class AppRuntime:
         self.reload(device, load_asr=load_asr)
 
     def reload(self, device: str, load_asr: bool | None = None) -> dict[str, Any]:
+        if self.model is not None:
+            old_model = self.model
+            self.model = None
+            del old_model
+            gc.collect()
+            if torch.backends.mps.is_available():
+                try:
+                    torch.mps.empty_cache()
+                except Exception:
+                    pass
         if load_asr is not None:
             self.load_asr = load_asr
         self.model, resolution, runtime_info = load_model_runtime(
@@ -115,6 +133,18 @@ class AppRuntime:
             )
         return "\n\n".join(lines)
 
+    def generate_with_fallback(self, **kwargs):
+        """Generate audio and retry on CPU if MPS runs out of memory."""
+        try:
+            return self.model.generate(**kwargs)  # type: ignore[union-attr]
+        except RuntimeError as exc:
+            message = str(exc)
+            if self.selected_backend == "mps" and "MPS backend out of memory" in message:
+                logger.warning("MPS OOM during generation; reloading model on CPU and retrying once.")
+                self.reload("cpu", load_asr=False)
+                return self.model.generate(**kwargs)  # type: ignore[union-attr]
+            raise
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -123,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--model", default="k2-fsa/OmniVoice")
-    parser.add_argument("--device", default="auto", choices=["auto", "mps", "cpu", "cuda"])
+    parser.add_argument("--device", default="cpu", choices=["auto", "mps", "cpu", "cuda"])
     parser.add_argument("--ip", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--root-path", default=None)
@@ -192,11 +222,7 @@ def _format_reference_report(report_dict: dict[str, Any]) -> str:
 
 
 def build_demo(runtime: AppRuntime) -> gr.Blocks:
-    theme = gr.themes.Soft(font=["IBM Plex Sans", "Avenir Next", "sans-serif"])
-    css = """
-    .gradio-container {max-width: 1280px !important; font-size: 16px !important;}
-    .hero {background: linear-gradient(135deg, #eef6ff, #f5f1e8); border-radius: 20px; padding: 20px;}
-    """
+    initial_voice_choices = _voice_choices(runtime.voice_library)
 
     def gen_config(num_step, guidance_scale, denoise, preprocess_prompt, postprocess_output):
         return OmniVoiceGenerationConfig(
@@ -241,7 +267,9 @@ def build_demo(runtime: AppRuntime) -> gr.Blocks:
             language=_normalize_language(language),
             preprocess_prompt=bool(preprocess_prompt),
         )
-        audio = runtime.model.generate(  # type: ignore[union-attr]
+        fallback_note = ""
+        start_backend = runtime.selected_backend
+        audio = runtime.generate_with_fallback(
             text=text.strip(),
             language=_normalize_language(language),
             voice_clone_prompt=prompt,
@@ -250,7 +278,9 @@ def build_demo(runtime: AppRuntime) -> gr.Blocks:
             duration=float(duration) if duration else None,
             generation_config=gen_config(num_step, guidance_scale, denoise, preprocess_prompt, postprocess_output),
         )[0]
-        return _wave_to_numpy(audio, runtime.model.sampling_rate), "Generated from the current reference clip."  # type: ignore[union-attr]
+        if start_backend == "mps" and runtime.selected_backend == "cpu":
+            fallback_note = " MPS ran out of memory, so this retry used CPU."
+        return _wave_to_numpy(audio, runtime.model.sampling_rate), f"Generated from the current reference clip.{fallback_note}"  # type: ignore[union-attr]
 
     def save_voice_profile(prepared_state, voice_name, notes):
         if not voice_name or not voice_name.strip():
@@ -304,7 +334,9 @@ def build_demo(runtime: AppRuntime) -> gr.Blocks:
         if not text or not text.strip():
             return None, "Enter text to synthesize."
         prompt = runtime.voice_library.load_prompt(profile_id)
-        audio = runtime.model.generate(  # type: ignore[union-attr]
+        fallback_note = ""
+        start_backend = runtime.selected_backend
+        audio = runtime.generate_with_fallback(
             text=text.strip(),
             language=_normalize_language(language),
             voice_clone_prompt=prompt,
@@ -317,7 +349,9 @@ def build_demo(runtime: AppRuntime) -> gr.Blocks:
                 postprocess_output=bool(postprocess_output),
             ),
         )[0]
-        return _wave_to_numpy(audio, runtime.model.sampling_rate), "Generated from the saved voice profile."  # type: ignore[union-attr]
+        if start_backend == "mps" and runtime.selected_backend == "cpu":
+            fallback_note = " MPS ran out of memory, so this retry used CPU."
+        return _wave_to_numpy(audio, runtime.model.sampling_rate), f"Generated from the saved voice profile.{fallback_note}"  # type: ignore[union-attr]
 
     def rename_profile(profile_id, new_name):
         if not profile_id or not new_name.strip():
@@ -334,16 +368,16 @@ def build_demo(runtime: AppRuntime) -> gr.Blocks:
 
     def export_profile(profile_id):
         if not profile_id:
-            return None, "Choose a profile to export."
+            return "", "Choose a profile to export."
         path = runtime.voice_library.export_profile(
             profile_id, runtime.voice_library.root_dir / f"{profile_id}.zip"
         )
         return str(path), "Exported voice profile."
 
-    def import_profile(archive):
-        if not archive:
-            return gr.update(), "Choose a `.zip` voice profile export to import.", None
-        profile = runtime.voice_library.import_profile(archive)
+    def import_profile(archive_path):
+        if not archive_path:
+            return gr.update(), "Enter the path to a `.zip` voice profile export to import.", None
+        profile = runtime.voice_library.import_profile(archive_path)
         dropdown, details, ref_audio = refresh_profiles(profile.id)
         return dropdown, f"Imported `{profile.display_name}`.\n\n{details}", ref_audio
 
@@ -377,7 +411,9 @@ def build_demo(runtime: AppRuntime) -> gr.Blocks:
     def generate_designed_voice(text, language, num_step, guidance_scale, denoise, speed, duration, postprocess_output, *groups):
         if not text or not text.strip():
             return None, "Enter text to synthesize."
-        audio = runtime.model.generate(  # type: ignore[union-attr]
+        fallback_note = ""
+        start_backend = runtime.selected_backend
+        audio = runtime.generate_with_fallback(
             text=text.strip(),
             language=_normalize_language(language),
             instruct=_build_instruct(groups),
@@ -390,9 +426,11 @@ def build_demo(runtime: AppRuntime) -> gr.Blocks:
                 postprocess_output=bool(postprocess_output),
             ),
         )[0]
-        return _wave_to_numpy(audio, runtime.model.sampling_rate), "Generated with voice design."  # type: ignore[union-attr]
+        if start_backend == "mps" and runtime.selected_backend == "cpu":
+            fallback_note = " MPS ran out of memory, so this retry used CPU."
+        return _wave_to_numpy(audio, runtime.model.sampling_rate), f"Generated with voice design.{fallback_note}"  # type: ignore[union-attr]
 
-    with gr.Blocks(theme=theme, css=css, title="OmniVoice Mac Demo") as demo:
+    with gr.Blocks(title="OmniVoice Mac Demo") as demo:
         prepared_state = gr.State(None)
 
         gr.Markdown(
@@ -409,137 +447,141 @@ Clone a voice from a short clean clip, save it locally as a reusable profile, an
 
         runtime_markdown = gr.Markdown(runtime.summarize_runtime())
 
-        with gr.Tabs():
-            with gr.TabItem("Voice Clone"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        clone_text = gr.Textbox(label="Text to Synthesize", lines=4)
-                        ref_audio = gr.Audio(label="Reference Audio", type="filepath")
-                        gr.Markdown(
-                            "Use a clean **3-10 second** single-speaker clip. Avoid echo, music, clipping, and long pauses."
-                        )
-                        ref_text = gr.Textbox(
-                            label="Reference Transcript",
-                            lines=3,
-                            placeholder="Manual transcript is best. Leave blank to auto-transcribe if ASR is enabled.",
-                        )
-                        clone_lang = _lang_dropdown()
-                        auto_transcribe = gr.Checkbox(
-                            label="Auto transcribe when transcript is blank",
-                            value=runtime.load_asr,
-                        )
-                        voice_name = gr.Textbox(label="Voice Profile Name", placeholder="Narrator A")
-                        voice_notes = gr.Textbox(label="Notes (optional)", lines=2)
-                        with gr.Accordion("Advanced Generation Controls", open=False):
-                            clone_instruct = gr.Textbox(label="Optional Voice Instruction", lines=2)
-                            clone_num_step = gr.Slider(4, 64, value=32, step=1, label="Inference Steps")
-                            clone_guidance = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="Guidance Scale")
-                            clone_denoise = gr.Checkbox(label="Denoise", value=True)
-                            clone_speed = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Speed")
-                            clone_duration = gr.Number(value=None, label="Fixed Duration (seconds)")
-                            clone_preprocess = gr.Checkbox(label="Preprocess Reference", value=True)
-                            clone_postprocess = gr.Checkbox(label="Postprocess Output", value=True)
-                        with gr.Row():
-                            analyze_btn = gr.Button("Analyze Reference")
-                            save_btn = gr.Button("Save Voice Profile", variant="secondary")
-                            clone_btn = gr.Button("Generate Once", variant="primary")
-                    with gr.Column(scale=1):
-                        cleaned_ref_audio = gr.Audio(label="Cleaned Reference Preview", type="numpy")
-                        preprocess_report = gr.Markdown("Analyze a clip to see preprocessing details and warnings.")
-                        clone_output = gr.Audio(label="Generated Audio", type="numpy")
-                        clone_status = gr.Textbox(label="Status", lines=3)
-
-            with gr.TabItem("Saved Voices"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        voice_dropdown = gr.Dropdown(
-                            label="Saved Voice Profiles",
-                            choices=_voice_choices(runtime.voice_library),
-                            value=_voice_choices(runtime.voice_library)[0][1] if _voice_choices(runtime.voice_library) else None,
-                        )
-                        refresh_btn = gr.Button("Refresh Voices")
-                        saved_voice_text = gr.Textbox(label="Text to Synthesize", lines=4)
-                        saved_voice_lang = _lang_dropdown()
-                        rename_value = gr.Textbox(label="Rename Selected Voice")
-                        import_file = gr.File(label="Import Voice Profile (.zip)", type="filepath")
-                        with gr.Accordion("Advanced Generation Controls", open=False):
-                            saved_num_step = gr.Slider(4, 64, value=32, step=1, label="Inference Steps")
-                            saved_guidance = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="Guidance Scale")
-                            saved_denoise = gr.Checkbox(label="Denoise", value=True)
-                            saved_speed = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Speed")
-                            saved_duration = gr.Number(value=None, label="Fixed Duration (seconds)")
-                            saved_postprocess = gr.Checkbox(label="Postprocess Output", value=True)
-                        with gr.Row():
-                            generate_saved_btn = gr.Button("Generate From Saved Voice", variant="primary")
-                            rename_btn = gr.Button("Rename")
-                            delete_btn = gr.Button("Delete")
-                            export_btn = gr.Button("Export")
-                            import_btn = gr.Button("Import")
-                    with gr.Column(scale=1):
-                        profile_details = gr.Markdown("No saved voices yet.")
-                        profile_reference_audio = gr.Audio(label="Saved Reference Preview", type="numpy")
-                        saved_voice_output = gr.Audio(label="Generated Audio", type="numpy")
-                        saved_status = gr.Textbox(label="Status", lines=3)
-                        export_file = gr.File(label="Exported Voice Archive")
-
-
-            with gr.TabItem("Voice Design"):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        design_text = gr.Textbox(label="Text to Synthesize", lines=4)
-                        design_lang = _lang_dropdown()
-                        design_groups = [
-                            gr.Dropdown(
-                                label=category,
-                                choices=["Auto"] + choices,
-                                value="Auto",
-                                info=_ATTR_INFO.get(category),
-                            )
-                            for category, choices in _CATEGORIES.items()
-                        ]
-                        with gr.Accordion("Advanced Generation Controls", open=False):
-                            design_num_step = gr.Slider(4, 64, value=32, step=1, label="Inference Steps")
-                            design_guidance = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="Guidance Scale")
-                            design_denoise = gr.Checkbox(label="Denoise", value=True)
-                            design_speed = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Speed")
-                            design_duration = gr.Number(value=None, label="Fixed Duration (seconds)")
-                            design_postprocess = gr.Checkbox(label="Postprocess Output", value=True)
-                        design_btn = gr.Button("Generate Designed Voice", variant="primary")
-                    with gr.Column(scale=1):
-                        design_audio = gr.Audio(label="Output Audio", type="numpy")
-                        design_status = gr.Textbox(label="Status", lines=2)
-                design_btn.click(
-                    generate_designed_voice,
-                    inputs=[
-                        design_text,
-                        design_lang,
-                        design_num_step,
-                        design_guidance,
-                        design_denoise,
-                        design_speed,
-                        design_duration,
-                        design_postprocess,
-                    ]
-                    + design_groups,
-                    outputs=[design_audio, design_status],
+        gr.Markdown("## Voice Clone")
+        with gr.Row():
+            with gr.Column(scale=1):
+                clone_text = gr.Textbox(label="Text to Synthesize", lines=4)
+                ref_audio = gr.Audio(label="Reference Audio", type="filepath")
+                gr.Markdown(
+                    "Use a clean **3-10 second** single-speaker clip. Avoid echo, music, clipping, and long pauses."
                 )
+                ref_text = gr.Textbox(
+                    label="Reference Transcript",
+                    lines=3,
+                    placeholder="Manual transcript is best. Leave blank to auto-transcribe if ASR is enabled.",
+                )
+                clone_lang = _lang_dropdown()
+                auto_transcribe = gr.Checkbox(
+                    label="Auto transcribe when transcript is blank",
+                    value=runtime.load_asr,
+                )
+                voice_name = gr.Textbox(label="Voice Profile Name", placeholder="Narrator A")
+                voice_notes = gr.Textbox(label="Notes (optional)", lines=2)
+                with gr.Accordion("Advanced Generation Controls", open=False):
+                    clone_instruct = gr.Textbox(label="Optional Voice Instruction", lines=2)
+                    clone_num_step = gr.Slider(4, 64, value=32, step=1, label="Inference Steps")
+                    clone_guidance = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="Guidance Scale")
+                    clone_denoise = gr.Checkbox(label="Denoise", value=True)
+                    clone_speed = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Speed")
+                    clone_duration = gr.Number(value=None, label="Fixed Duration (seconds)")
+                    clone_preprocess = gr.Checkbox(label="Preprocess Reference", value=True)
+                    clone_postprocess = gr.Checkbox(label="Postprocess Output", value=True)
+                with gr.Row():
+                    analyze_btn = gr.Button("Analyze Reference")
+                    save_btn = gr.Button("Save Voice Profile", variant="secondary")
+                    clone_btn = gr.Button("Generate Once", variant="primary")
+            with gr.Column(scale=1):
+                cleaned_ref_audio = gr.Audio(label="Cleaned Reference Preview", type="numpy")
+                preprocess_report = gr.Markdown("Analyze a clip to see preprocessing details and warnings.")
+                clone_output = gr.Audio(label="Generated Audio", type="numpy")
+                clone_status = gr.Textbox(label="Status", lines=3)
 
-            with gr.TabItem("Diagnostics / Settings"):
-                backend_override = gr.Dropdown(
-                    label="Backend Override",
-                    choices=["auto"] + available_backends(),
-                    value="auto",
+        gr.Markdown("## Saved Voices")
+        with gr.Row():
+            with gr.Column(scale=1):
+                voice_dropdown = gr.Dropdown(
+                    label="Saved Voice Profiles",
+                    choices=initial_voice_choices,
+                    value=initial_voice_choices[0][1] if initial_voice_choices else None,
                 )
-                asr_toggle = gr.Checkbox(label="Enable ASR auto transcription", value=runtime.load_asr)
-                diagnostics_btn = gr.Button("Reload Backend / Apply Settings")
-                benchmark_btn = gr.Button("Quick Benchmark")
-                benchmark_audio = gr.Audio(label="Benchmark Output", type="numpy")
-                benchmark_status = gr.Textbox(label="Benchmark Status", lines=2)
-                diagnostics_raw = gr.Code(
-                    value=json.dumps(runtime.runtime_info, indent=2),
-                    label="Raw Runtime Metadata",
-                    language="json",
+                refresh_btn = gr.Button("Refresh Voices")
+                saved_voice_text = gr.Textbox(label="Text to Synthesize", lines=4)
+                saved_voice_lang = gr.Textbox(
+                    label="Language Override (optional)",
+                    placeholder="Leave blank for Auto, or enter a language like English / en",
                 )
+                rename_value = gr.Textbox(label="Rename Selected Voice")
+                import_file = gr.Textbox(
+                    label="Import Voice Profile (.zip path)",
+                    placeholder="/path/to/voice-profile.zip",
+                )
+                with gr.Accordion("Advanced Generation Controls", open=False):
+                    saved_num_step = gr.Slider(4, 64, value=32, step=1, label="Inference Steps")
+                    saved_guidance = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="Guidance Scale")
+                    saved_denoise = gr.Checkbox(label="Denoise", value=True)
+                    saved_speed = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Speed")
+                    saved_duration = gr.Number(value=None, label="Fixed Duration (seconds)")
+                    saved_postprocess = gr.Checkbox(label="Postprocess Output", value=True)
+                with gr.Row():
+                    generate_saved_btn = gr.Button("Generate From Saved Voice", variant="primary")
+                    rename_btn = gr.Button("Rename")
+                    delete_btn = gr.Button("Delete")
+                    export_btn = gr.Button("Export")
+                    import_btn = gr.Button("Import")
+            with gr.Column(scale=1):
+                profile_details = gr.Markdown("No saved voices yet.")
+                profile_reference_audio = gr.Audio(label="Saved Reference Preview", type="numpy")
+                saved_voice_output = gr.Audio(label="Generated Audio", type="numpy")
+                saved_status = gr.Textbox(label="Status", lines=3)
+                export_file = gr.Textbox(label="Exported Voice Archive Path")
+
+        gr.Markdown("## Voice Design")
+        with gr.Row():
+            with gr.Column(scale=1):
+                design_text = gr.Textbox(label="Text to Synthesize", lines=4)
+                design_lang = _lang_dropdown()
+                design_groups = [
+                    gr.Dropdown(
+                        label=category,
+                        choices=["Auto"] + choices,
+                        value="Auto",
+                        info=_ATTR_INFO.get(category),
+                    )
+                    for category, choices in _CATEGORIES.items()
+                ]
+                with gr.Accordion("Advanced Generation Controls", open=False):
+                    design_num_step = gr.Slider(4, 64, value=32, step=1, label="Inference Steps")
+                    design_guidance = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="Guidance Scale")
+                    design_denoise = gr.Checkbox(label="Denoise", value=True)
+                    design_speed = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Speed")
+                    design_duration = gr.Number(value=None, label="Fixed Duration (seconds)")
+                    design_postprocess = gr.Checkbox(label="Postprocess Output", value=True)
+                design_btn = gr.Button("Generate Designed Voice", variant="primary")
+            with gr.Column(scale=1):
+                design_audio = gr.Audio(label="Output Audio", type="numpy")
+                design_status = gr.Textbox(label="Status", lines=2)
+        design_btn.click(
+            generate_designed_voice,
+            inputs=[
+                design_text,
+                design_lang,
+                design_num_step,
+                design_guidance,
+                design_denoise,
+                design_speed,
+                design_duration,
+                design_postprocess,
+            ]
+            + design_groups,
+            outputs=[design_audio, design_status],
+        )
+
+        gr.Markdown("## Diagnostics / Settings")
+        backend_override = gr.Dropdown(
+            label="Backend Override",
+            choices=["auto"] + available_backends(),
+            value="auto",
+        )
+        asr_toggle = gr.Checkbox(label="Enable ASR auto transcription", value=runtime.load_asr)
+        diagnostics_btn = gr.Button("Reload Backend / Apply Settings")
+        benchmark_btn = gr.Button("Quick Benchmark")
+        benchmark_audio = gr.Audio(label="Benchmark Output", type="numpy")
+        benchmark_status = gr.Textbox(label="Benchmark Status", lines=2)
+        diagnostics_raw = gr.Code(
+            value=json.dumps(runtime.runtime_info, indent=2),
+            label="Raw Runtime Metadata",
+            language="json",
+        )
 
         analyze_btn.click(
             prepare_reference,
@@ -634,6 +676,8 @@ def main(argv=None) -> int:
         server_port=args.port,
         share=args.share,
         root_path=args.root_path,
+        theme=APP_THEME,
+        css=APP_CSS,
     )
     return 0
 

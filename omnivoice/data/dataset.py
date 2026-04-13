@@ -46,7 +46,10 @@ import torch
 import torch.distributed as dist
 import torchaudio
 import webdataset as wds
+from pydub import AudioSegment
 from torch.utils.data import IterableDataset
+
+from omnivoice.utils.audio import _numpy_audio_to_tensor, load_audio_file_any
 
 
 def load_audio_webdataset(data, sample_rate: int = 24000, device="cpu"):
@@ -54,7 +57,21 @@ def load_audio_webdataset(data, sample_rate: int = 24000, device="cpu"):
     Load audio from bytes data and resample to the target sample rate if needed.
     Return a tensor of shape (1, num_samples)
     """
-    audio, sr = torchaudio.load(io.BytesIO(data))
+    try:
+        import soundfile as sf
+
+        audio_data, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=False)
+        audio = _numpy_audio_to_tensor(audio_data)
+    except Exception:
+        buffer = io.BytesIO(data)
+        aseg = AudioSegment.from_file(buffer)
+        audio_data = np.array(aseg.get_array_of_samples()).astype(np.float32)
+        max_int = float(1 << (8 * aseg.sample_width - 1))
+        audio_data = audio_data / max_int
+        if aseg.channels > 1:
+            audio_data = audio_data.reshape(-1, aseg.channels)
+        audio = _numpy_audio_to_tensor(audio_data)
+        sr = aseg.frame_rate
     audio = audio.to(device)
     if audio.size(dim=0) > 1:
         audio = torch.mean(audio, dim=0)
@@ -433,7 +450,7 @@ class JsonlDatasetReader(IterableDataReader):
                 )
                 continue
             try:
-                waveform, sr = torchaudio.load(audio_path)
+                waveform, sr = load_audio_file_any(audio_path)
                 if waveform.shape[0] > 1:
                     waveform = waveform.mean(dim=0, keepdim=True)
                 if sr != self.sample_rate:

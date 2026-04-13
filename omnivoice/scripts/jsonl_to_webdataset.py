@@ -65,10 +65,12 @@ from concurrent.futures import (
 from itertools import islice
 from pathlib import Path
 
+import soundfile as sf
 import torchaudio
 import webdataset as wds
 from tqdm import tqdm
 
+from omnivoice.utils.audio import load_audio_file_any
 from omnivoice.utils.common import str2bool
 
 
@@ -164,7 +166,7 @@ def process_audio_item(meta, target_sr):
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"{audio_path} not found")
 
-        waveform, sr = torchaudio.load(audio_path)
+        waveform, sr = load_audio_file_any(audio_path)
         audio_duration = waveform.shape[1] / sr
         meta["audio_duration"] = audio_duration
 
@@ -173,7 +175,7 @@ def process_audio_item(meta, target_sr):
             sr = target_sr
 
         audio_buffer = io.BytesIO()
-        torchaudio.save(audio_buffer, waveform, sr, format="flac", bits_per_sample=16)
+        sf.write(audio_buffer, waveform.transpose(0, 1).cpu().numpy(), sr, format="FLAC")
         audio_bytes = audio_buffer.getvalue()
 
         sample = {

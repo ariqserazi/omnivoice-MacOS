@@ -68,11 +68,13 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 import webdataset as wds
+from pydub import AudioSegment
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import tqdm
 from transformers import AutoFeatureExtractor, HiggsAudioV2TokenizerModel
 
 from omnivoice.data.dataset import JsonlDatasetReader, WebDatasetReader
+from omnivoice.utils.audio import _numpy_audio_to_tensor
 from omnivoice.utils.common import str2bool
 
 warnings.filterwarnings(
@@ -208,7 +210,21 @@ def serialise_numpy(key: str, tokens: np.ndarray) -> dict:
 def _load_aug_audio(data, sample_rate=24000):
     """Simple audio loader for augmentation files."""
     with io.BytesIO(data) as b:
-        wav, sr = torchaudio.load(b)
+        try:
+            import soundfile as sf
+
+            audio_data, sr = sf.read(b, dtype="float32", always_2d=False)
+            wav = _numpy_audio_to_tensor(audio_data)
+        except Exception:
+            b.seek(0)
+            aseg = AudioSegment.from_file(b)
+            audio_data = np.array(aseg.get_array_of_samples()).astype(np.float32)
+            max_int = float(1 << (8 * aseg.sample_width - 1))
+            audio_data = audio_data / max_int
+            if aseg.channels > 1:
+                audio_data = audio_data.reshape(-1, aseg.channels)
+            wav = _numpy_audio_to_tensor(audio_data)
+            sr = aseg.frame_rate
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
     if sr != sample_rate:
