@@ -53,11 +53,11 @@ from transformers.modeling_outputs import ModelOutput
 from transformers.models.auto import CONFIG_MAPPING, AutoConfig
 
 from omnivoice.utils.audio import (
+    ReferenceAudioReport,
     cross_fade_chunks,
     fade_and_pad_audio,
-    load_audio,
+    preprocess_reference_audio,
     remove_silence,
-    trim_long_audio,
 )
 from omnivoice.utils.duration import RuleDurationEstimator
 from omnivoice.utils.lang_map import LANG_IDS, LANG_NAMES
@@ -85,6 +85,8 @@ class VoiceClonePrompt:
     ref_audio_tokens: torch.Tensor  # (C, T)
     ref_text: str
     ref_rms: float
+    language: Optional[str] = None
+    reference_report: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -585,6 +587,7 @@ class OmniVoice(PreTrainedModel):
         ref_audio: Union[str, tuple[torch.Tensor, int]],
         ref_text: Optional[str] = None,
         preprocess_prompt: bool = True,
+        language: Optional[str] = None,
     ) -> VoiceClonePrompt:
         """Create a reusable voice clone prompt from reference audio.
 
@@ -601,50 +604,16 @@ class OmniVoice(PreTrainedModel):
         Returns:
             A :class:`VoiceClonePrompt` that can be passed to :meth:`generate`.
         """
-        if self.audio_tokenizer is None:
-            raise RuntimeError(
-                "Audio tokenizer is not loaded. Make sure you loaded the model "
-                "with OmniVoice.from_pretrained()."
-            )
-
-        if isinstance(ref_audio, str):
-            ref_wav = load_audio(ref_audio, self.sampling_rate)
-        else:
-            waveform, sr = ref_audio
-            if waveform.dim() == 1:
-                waveform = waveform.unsqueeze(0)
-            if waveform.size(0) > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
-            if sr != self.sampling_rate:
-                waveform = torchaudio.functional.resample(
-                    waveform, sr, self.sampling_rate
-                )
-            ref_wav = waveform
-
-        ref_rms = torch.sqrt(torch.mean(torch.square(ref_wav))).item()
-        if 0 < ref_rms < 0.1:
-            ref_wav = ref_wav * 0.1 / ref_rms
-
-        if preprocess_prompt:
-            # Trim long reference audio (>20s) by splitting at the largest silence gap.
-            # Skip trimming when ref_text is user-provided, otherwise the
-            # trimmed audio will no longer match the full transcript.
-            if ref_text is None:
-                ref_wav = trim_long_audio(
-                    ref_wav, self.sampling_rate, trim_threshold=20.0
-                )
-            ref_wav = remove_silence(
-                ref_wav,
-                self.sampling_rate,
-                mid_sil=200,
-                lead_sil=100,
-                trail_sil=200,
-            )
-            if ref_wav.size(-1) == 0:
-                raise ValueError(
-                    "Reference audio is empty after silence removal. "
-                    "Try setting preprocess_prompt=False."
-                )
+        prepared = self.prepare_voice_clone_reference(
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            preprocess_prompt=preprocess_prompt,
+            language=language,
+        )
+        ref_wav = prepared["waveform"]
+        ref_text = prepared["ref_text"]
+        report = prepared["report"]
+        ref_rms = float(prepared["ref_rms"])
 
         ref_duration = ref_wav.size(-1) / self.sampling_rate
         if ref_duration > 20.0:
@@ -654,14 +623,6 @@ class OmniVoice(PreTrainedModel):
                 "quality. We recommend trimming it to 3-10s.",
                 ref_duration,
             )
-
-        # Auto-transcribe if ref_text not provided
-        if ref_text is None:
-            if self._asr_pipe is None:
-                logger.info("ASR model not loaded yet, loading on-the-fly ...")
-                self.load_asr_model()
-            ref_text = self.transcribe((ref_wav, self.sampling_rate))
-            logger.debug("Auto-transcribed ref_text: %s", ref_text)
 
         chunk_size = self.audio_tokenizer.config.hop_length
         clip_size = int(ref_wav.size(-1) % chunk_size)
@@ -679,7 +640,88 @@ class OmniVoice(PreTrainedModel):
             ref_audio_tokens=ref_audio_tokens,
             ref_text=ref_text,
             ref_rms=ref_rms,
+            language=language,
+            reference_report=report.to_dict(),
         )
+
+    def prepare_voice_clone_reference(
+        self,
+        ref_audio: Union[str, tuple[torch.Tensor, int]],
+        ref_text: Optional[str] = None,
+        preprocess_prompt: bool = True,
+        language: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Prepare reference audio and transcript for reusable voice cloning."""
+        if self.audio_tokenizer is None:
+            raise RuntimeError(
+                "Audio tokenizer is not loaded. Make sure you loaded the model "
+                "with OmniVoice.from_pretrained()."
+            )
+
+        ref_wav, report = preprocess_reference_audio(
+            ref_audio,
+            self.sampling_rate,
+            preprocess_prompt=preprocess_prompt,
+            ref_text=ref_text,
+        )
+
+        ref_rms = float(torch.sqrt(torch.mean(torch.square(ref_wav))).item())
+
+        if ref_text is None:
+            if self._asr_pipe is None:
+                logger.info("ASR model not loaded yet, loading on-the-fly ...")
+                self.load_asr_model()
+            ref_text = self.transcribe((ref_wav, self.sampling_rate))
+            logger.debug("Auto-transcribed ref_text: %s", ref_text)
+
+        transcript_warnings = self._transcript_warnings(
+            transcript=ref_text,
+            audio_report=report,
+            language=language,
+        )
+        if transcript_warnings:
+            report.warnings.extend(
+                warning for warning in transcript_warnings if warning not in report.warnings
+            )
+
+        if preprocess_prompt:
+            ref_text = add_punctuation(ref_text)
+
+        return {
+            "waveform": ref_wav,
+            "ref_text": ref_text,
+            "ref_rms": ref_rms,
+            "report": report,
+        }
+
+    def _transcript_warnings(
+        self,
+        transcript: str,
+        audio_report: ReferenceAudioReport,
+        language: Optional[str] = None,
+    ) -> list[str]:
+        warnings = []
+        text = transcript.strip()
+        if not text:
+            warnings.append("Transcript is empty. Voice cloning works better with an accurate transcript.")
+            return warnings
+
+        words = re.findall(r"\w+", text)
+        if len(words) < 2 and len(text) < 8:
+            warnings.append("Transcript is extremely short and may not match the spoken clip well.")
+
+        chars_per_second = len(text) / max(audio_report.cleaned_duration, 0.1)
+        if chars_per_second > 35:
+            warnings.append(
+                "Transcript may be longer than the spoken clip; mismatched transcripts can reduce clone quality."
+            )
+        if chars_per_second < 2:
+            warnings.append(
+                "Transcript may be too short for the spoken clip; mismatched transcripts can reduce clone quality."
+            )
+        if language and language not in LANG_NAMES and language not in LANG_IDS:
+            warnings.append("Selected language is not recognized by OmniVoice.")
+        return warnings
 
     def _decode_and_post_process(
         self,

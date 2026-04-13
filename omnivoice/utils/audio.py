@@ -22,11 +22,33 @@ cross-fading, and format conversion. Used by ``OmniVoice.generate()`` during
 inference post-processing.
 """
 
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from typing import Any, Optional
+
 import numpy as np
 import torch
 import torchaudio
 from pydub import AudioSegment
 from pydub.silence import detect_leading_silence, detect_nonsilent, split_on_silence
+
+
+@dataclass
+class ReferenceAudioReport:
+    sample_rate: int
+    original_duration: float
+    cleaned_duration: float
+    original_channels: int
+    peak: float
+    rms: float
+    clipped_ratio: float
+    silence_ratio: float
+    warnings: list[str]
+    operations: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def load_audio(audio_path: str, sampling_rate: int):
@@ -65,6 +87,148 @@ def load_audio(audio_path: str, sampling_rate: int):
         waveform = torch.mean(waveform, dim=0, keepdim=True)
 
     return waveform
+
+
+def analyze_waveform(
+    waveform: torch.Tensor,
+    sample_rate: int,
+    *,
+    original_duration: Optional[float] = None,
+    original_channels: int = 1,
+    warnings: Optional[list[str]] = None,
+    operations: Optional[list[str]] = None,
+) -> ReferenceAudioReport:
+    mono = waveform
+    if mono.dim() == 2:
+        mono = mono.mean(dim=0)
+    mono = mono.float()
+
+    peak = float(mono.abs().max().item()) if mono.numel() else 0.0
+    rms = float(torch.sqrt(torch.mean(torch.square(mono))).item()) if mono.numel() else 0.0
+    clipped_ratio = (
+        float((mono.abs() > 0.98).float().mean().item()) if mono.numel() else 0.0
+    )
+    silence_ratio = (
+        float((mono.abs() < 0.01).float().mean().item()) if mono.numel() else 1.0
+    )
+    cleaned_duration = float(mono.numel() / max(sample_rate, 1))
+    original_duration = (
+        cleaned_duration if original_duration is None else float(original_duration)
+    )
+
+    report_warnings = list(warnings or [])
+    if cleaned_duration < 2.5:
+        report_warnings.append("Reference audio is very short; 3-10 seconds works best.")
+    if cleaned_duration > 12.0:
+        report_warnings.append(
+            "Reference audio is fairly long; speaker consistency is usually better around 3-10 seconds."
+        )
+    if clipped_ratio > 0.01:
+        report_warnings.append("Reference audio looks clipped or distorted.")
+    if silence_ratio > 0.6:
+        report_warnings.append("Reference audio contains a lot of silence or dead air.")
+    if rms < 0.01:
+        report_warnings.append("Reference audio is very quiet.")
+
+    return ReferenceAudioReport(
+        sample_rate=sample_rate,
+        original_duration=original_duration,
+        cleaned_duration=cleaned_duration,
+        original_channels=original_channels,
+        peak=peak,
+        rms=rms,
+        clipped_ratio=clipped_ratio,
+        silence_ratio=silence_ratio,
+        warnings=list(dict.fromkeys(report_warnings)),
+        operations=list(operations or []),
+    )
+
+
+def preprocess_reference_audio(
+    ref_audio: str | tuple[torch.Tensor, int],
+    sampling_rate: int,
+    *,
+    preprocess_prompt: bool = True,
+    ref_text: Optional[str] = None,
+) -> tuple[torch.Tensor, ReferenceAudioReport]:
+    """Load and gently clean reference audio for voice cloning."""
+    operations: list[str] = []
+    warnings: list[str] = []
+
+    if isinstance(ref_audio, str):
+        try:
+            raw_waveform, original_sr = torchaudio.load(ref_audio, backend="soundfile")
+        except (RuntimeError, OSError):
+            aseg = AudioSegment.from_file(ref_audio)
+            audio_data = np.array(aseg.get_array_of_samples()).astype(np.float32) / 32768.0
+            if aseg.channels == 1:
+                raw_waveform = torch.from_numpy(audio_data).unsqueeze(0)
+            else:
+                raw_waveform = torch.from_numpy(audio_data.reshape(-1, aseg.channels).T)
+            original_sr = aseg.frame_rate
+            operations.append("loaded audio through ffmpeg fallback")
+        else:
+            operations.append("loaded audio from file")
+    else:
+        raw_waveform, original_sr = ref_audio
+        if raw_waveform.dim() == 1:
+            raw_waveform = raw_waveform.unsqueeze(0)
+        operations.append("loaded audio from tensor input")
+
+    original_channels = int(raw_waveform.shape[0])
+    original_duration = float(raw_waveform.shape[-1] / max(original_sr, 1))
+    waveform = raw_waveform.float()
+
+    if original_channels > 1:
+        waveform = torch.mean(waveform, dim=0, keepdim=True)
+        operations.append("converted to mono")
+
+    if original_sr != sampling_rate:
+        waveform = torchaudio.functional.resample(waveform, original_sr, sampling_rate)
+        operations.append(f"resampled {original_sr}Hz -> {sampling_rate}Hz")
+
+    if preprocess_prompt:
+        if ref_text is None:
+            trimmed = trim_long_audio(waveform, sampling_rate, trim_threshold=20.0)
+            if trimmed.shape[-1] != waveform.shape[-1]:
+                waveform = trimmed
+                operations.append("trimmed long reference at largest silence gap")
+        cleaned = remove_silence(
+            waveform,
+            sampling_rate,
+            mid_sil=250,
+            lead_sil=120,
+            trail_sil=220,
+        )
+        if cleaned.shape[-1] != waveform.shape[-1]:
+            waveform = cleaned
+            operations.append("removed long dead air and edge silence")
+
+    peak = float(waveform.abs().max().item()) if waveform.numel() else 0.0
+    rms = float(torch.sqrt(torch.mean(torch.square(waveform))).item()) if waveform.numel() else 0.0
+
+    if waveform.numel() == 0:
+        raise ValueError(
+            "Reference audio is empty after preprocessing. Try a cleaner clip or disable prompt preprocessing."
+        )
+
+    if 0 < rms < 0.1:
+        waveform = waveform * (0.1 / rms)
+        operations.append("applied conservative loudness normalization")
+
+    if peak > 1.0:
+        waveform = waveform / peak
+        operations.append("scaled down peaks to avoid clipping")
+
+    report = analyze_waveform(
+        waveform,
+        sampling_rate,
+        original_duration=original_duration,
+        original_channels=original_channels,
+        warnings=warnings,
+        operations=operations,
+    )
+    return waveform, report
 
 
 def remove_silence(

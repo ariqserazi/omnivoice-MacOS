@@ -43,6 +43,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
 
 eval = [
     "jiwer==3.1.0",       # WER
@@ -58,6 +61,8 @@ eval = [
 omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
 omnivoice-demo = "omnivoice.cli.demo:main"
+omnivoice-voices = "omnivoice.cli.voices:main"
+omnivoice-diagnose-mac = "omnivoice.cli.diagnose_mac:main"
 
 [project.urls]
 Homepage = "https://github.com/k2-fsa/OmniVoice"

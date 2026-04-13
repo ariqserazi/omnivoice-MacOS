@@ -1,60 +1,28 @@
 #!/usr/bin/env python3
-# Copyright    2026  Xiaomi Corp.        (authors:  Han Zhu)
-#
-# See ../../LICENSE for clarification regarding multiple authors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-Gradio demo for OmniVoice.
+"""Gradio demo for OmniVoice with saved local voice profiles."""
 
-Supports voice cloning and voice design.
-
-Usage:
-    omnivoice-demo --model /path/to/checkpoint --port 8000
-"""
+from __future__ import annotations
 
 import argparse
+import json
 import logging
-from typing import Any, Dict
+import time
+from dataclasses import asdict
+from typing import Any
 
 import gradio as gr
 import numpy as np
-import torch
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from omnivoice.utils.backend import available_backends
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
+from omnivoice.utils.runtime import load_model_runtime
+from omnivoice.utils.voice_profiles import VoiceLibrary
 
+logger = logging.getLogger(__name__)
 
-def get_best_device():
-    """Auto-detect the best available device: CUDA > MPS > CPU."""
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-# ---------------------------------------------------------------------------
-# Language list — all 600+ supported languages
-# ---------------------------------------------------------------------------
 _ALL_LANGUAGES = ["Auto"] + sorted(lang_display_name(n) for n in LANG_NAMES)
 
-
-# ---------------------------------------------------------------------------
-# Voice Design instruction templates
-# ---------------------------------------------------------------------------
-# Each option is displayed as "English / 中文".
-# The model expects English for accents and Chinese for dialects.
 _CATEGORIES = {
     "Gender / 性别": ["Male / 男", "Female / 女"],
     "Age / 年龄": [
@@ -105,9 +73,47 @@ _ATTR_INFO = {
     "Chinese Dialect / 中文方言": "Only effective for Chinese speech.",
 }
 
-# ---------------------------------------------------------------------------
-# Argument parser
-# ---------------------------------------------------------------------------
+
+class AppRuntime:
+    def __init__(self, checkpoint: str, device: str, load_asr: bool, voices_dir: str | None):
+        self.checkpoint = checkpoint
+        self.load_asr = load_asr
+        self.voice_library = VoiceLibrary(voices_dir)
+        self.model: OmniVoice | None = None
+        self.runtime_info: dict[str, Any] = {}
+        self.selected_backend = device
+        self.reload(device, load_asr=load_asr)
+
+    def reload(self, device: str, load_asr: bool | None = None) -> dict[str, Any]:
+        if load_asr is not None:
+            self.load_asr = load_asr
+        self.model, resolution, runtime_info = load_model_runtime(
+            self.checkpoint,
+            requested_device=device,
+            load_asr=self.load_asr,
+            run_backend_check=True,
+        )
+        self.runtime_info = runtime_info
+        self.selected_backend = resolution.selected
+        return runtime_info
+
+    def summarize_runtime(self) -> str:
+        resolution = self.runtime_info.get("resolution", {})
+        diagnostics = self.runtime_info.get("diagnostics")
+        lines = [
+            f"**Active backend:** `{resolution.get('selected', 'unknown')}`",
+            f"**Requested backend:** `{resolution.get('requested', 'auto')}`",
+            f"**Dtype:** `{resolution.get('dtype', 'unknown')}`",
+            f"**Saved voices:** `{len(self.voice_library.list_profiles())}`",
+            f"**Voice library:** `{self.voice_library.root_dir}`",
+        ]
+        if resolution.get("fallback_reason"):
+            lines.append(f"**Fallback:** {resolution['fallback_reason']}")
+        if diagnostics:
+            lines.append(
+                f"**Last backend check:** `{diagnostics.get('reason', 'unknown')}` at `{diagnostics.get('checked_at', 'n/a')}`"
+            )
+        return "\n\n".join(lines)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,392 +122,494 @@ def build_parser() -> argparse.ArgumentParser:
         description="Launch a Gradio demo for OmniVoice.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument(
-        "--model",
-        default="k2-fsa/OmniVoice",
-        help="Model checkpoint path or HuggingFace repo id.",
-    )
-    parser.add_argument(
-        "--device", default=None, help="Device to use. Auto-detected if not specified."
-    )
-    parser.add_argument("--ip", default="0.0.0.0", help="Server IP (default: 0.0.0.0).")
-    parser.add_argument(
-        "--port", type=int, default=7860, help="Server port (default: 7860)."
-    )
-    parser.add_argument(
-        "--root-path",
-        default=None,
-        help="Root path for reverse proxy.",
-    )
-    parser.add_argument(
-        "--share", action="store_true", default=False, help="Create public link."
-    )
-    parser.add_argument(
-        "--no-asr",
-        action="store_true",
-        default=False,
-        help="Skip loading Whisper ASR model. Reference text auto-transcription"
-        " will be unavailable.",
-    )
+    parser.add_argument("--model", default="k2-fsa/OmniVoice")
+    parser.add_argument("--device", default="auto", choices=["auto", "mps", "cpu", "cuda"])
+    parser.add_argument("--ip", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--root-path", default=None)
+    parser.add_argument("--share", action="store_true", default=False)
+    parser.add_argument("--no-asr", action="store_true", default=False)
+    parser.add_argument("--voices-dir", default=None)
     return parser
 
 
-# ---------------------------------------------------------------------------
-# Build demo
-# ---------------------------------------------------------------------------
+def _lang_dropdown(label="Language (optional) / 语种 (可选)", value="Auto"):
+    return gr.Dropdown(
+        label=label,
+        choices=_ALL_LANGUAGES,
+        value=value,
+        allow_custom_value=False,
+        interactive=True,
+        info="Keep as Auto to auto-detect the language.",
+    )
 
 
-def build_demo(
-    model: OmniVoice,
-    checkpoint: str,
-    generate_fn=None,
-) -> gr.Blocks:
+def _normalize_language(language: str | None) -> str | None:
+    if not language or language == "Auto":
+        return None
+    return language
 
-    sampling_rate = model.sampling_rate
 
-    # -- shared generation core --
-    def _gen_core(
-        text,
-        language,
-        ref_audio,
-        instruct,
-        num_step,
-        guidance_scale,
-        denoise,
-        speed,
-        duration,
-        preprocess_prompt,
-        postprocess_output,
-        mode,
-        ref_text=None,
-    ):
-        if not text or not text.strip():
-            return None, "Please enter the text to synthesize."
+def _wave_to_numpy(audio, sample_rate: int):
+    waveform = audio.squeeze(0).detach().cpu().numpy()
+    return sample_rate, (waveform * 32767).astype(np.int16)
 
-        gen_config = OmniVoiceGenerationConfig(
+
+def _voice_choices(library: VoiceLibrary):
+    profiles = library.list_profiles()
+    return [(f"{profile.display_name} ({profile.id[:8]})", profile.id) for profile in profiles]
+
+
+def _format_profile(profile) -> str:
+    report = (profile.metadata or {}).get("reference_report", {})
+    warnings = report.get("warnings", [])
+    return "\n\n".join(
+        [
+            f"**Name:** {profile.display_name}",
+            f"**ID:** `{profile.id}`",
+            f"**Created:** `{profile.created_at}`",
+            f"**Duration:** `{profile.duration_seconds:.2f}s`",
+            f"**Language:** `{profile.language or 'Auto'}`",
+            f"**Transcript:** {profile.transcript}",
+            f"**Warnings:** {'; '.join(warnings) if warnings else 'None'}",
+        ]
+    )
+
+
+def _format_reference_report(report_dict: dict[str, Any]) -> str:
+    warnings = report_dict.get("warnings") or []
+    operations = report_dict.get("operations") or []
+    return "\n\n".join(
+        [
+            f"**Cleaned duration:** `{report_dict.get('cleaned_duration', 0.0):.2f}s`",
+            f"**Original duration:** `{report_dict.get('original_duration', 0.0):.2f}s`",
+            f"**Peak:** `{report_dict.get('peak', 0.0):.3f}`",
+            f"**RMS:** `{report_dict.get('rms', 0.0):.3f}`",
+            f"**Processing:** {'; '.join(operations) if operations else 'none'}",
+            f"**Warnings:** {'; '.join(warnings) if warnings else 'None'}",
+        ]
+    )
+
+
+def build_demo(runtime: AppRuntime) -> gr.Blocks:
+    theme = gr.themes.Soft(font=["IBM Plex Sans", "Avenir Next", "sans-serif"])
+    css = """
+    .gradio-container {max-width: 1280px !important; font-size: 16px !important;}
+    .hero {background: linear-gradient(135deg, #eef6ff, #f5f1e8); border-radius: 20px; padding: 20px;}
+    """
+
+    def gen_config(num_step, guidance_scale, denoise, preprocess_prompt, postprocess_output):
+        return OmniVoiceGenerationConfig(
             num_step=int(num_step or 32),
-            guidance_scale=float(guidance_scale) if guidance_scale is not None else 2.0,
-            denoise=bool(denoise) if denoise is not None else True,
+            guidance_scale=float(guidance_scale or 2.0),
+            denoise=bool(denoise),
             preprocess_prompt=bool(preprocess_prompt),
             postprocess_output=bool(postprocess_output),
         )
 
-        lang = language if (language and language != "Auto") else None
+    def prepare_reference(ref_audio, ref_text, language, preprocess_prompt, auto_transcribe):
+        if not ref_audio:
+            return None, None, "Upload a reference clip to inspect or save it."
+        approved_text = ref_text.strip() if ref_text else None
+        if not approved_text and not auto_transcribe:
+            return None, None, "Provide a transcript or enable auto transcription."
 
-        kw: Dict[str, Any] = dict(
-            text=text.strip(), language=lang, generation_config=gen_config
+        prepared = runtime.model.prepare_voice_clone_reference(  # type: ignore[union-attr]
+            ref_audio,
+            ref_text=approved_text,
+            language=_normalize_language(language),
+            preprocess_prompt=bool(preprocess_prompt),
+        )
+        report_dict = prepared["report"].to_dict()
+        state = {
+            "waveform": prepared["waveform"],
+            "ref_text": prepared["ref_text"],
+            "language": _normalize_language(language),
+            "report": report_dict,
+        }
+        return state, _wave_to_numpy(prepared["waveform"], runtime.model.sampling_rate), _format_reference_report(report_dict)  # type: ignore[union-attr]
+
+    def clone_once(text, language, ref_audio, ref_text, instruct, num_step, guidance_scale, denoise, speed, duration, preprocess_prompt, postprocess_output):
+        if not text or not text.strip():
+            return None, "Enter the text you want to synthesize."
+        if not ref_audio:
+            return None, "Upload a reference audio clip first."
+
+        prompt = runtime.model.create_voice_clone_prompt(  # type: ignore[union-attr]
+            ref_audio,
+            ref_text=ref_text or None,
+            language=_normalize_language(language),
+            preprocess_prompt=bool(preprocess_prompt),
+        )
+        audio = runtime.model.generate(  # type: ignore[union-attr]
+            text=text.strip(),
+            language=_normalize_language(language),
+            voice_clone_prompt=prompt,
+            instruct=instruct or None,
+            speed=float(speed or 1.0),
+            duration=float(duration) if duration else None,
+            generation_config=gen_config(num_step, guidance_scale, denoise, preprocess_prompt, postprocess_output),
+        )[0]
+        return _wave_to_numpy(audio, runtime.model.sampling_rate), "Generated from the current reference clip."  # type: ignore[union-attr]
+
+    def save_voice_profile(prepared_state, voice_name, notes):
+        if not voice_name or not voice_name.strip():
+            return gr.update(), gr.update(), None, "Enter a name before saving the voice."
+        if not prepared_state:
+            return gr.update(), gr.update(), None, "Analyze the reference clip first so the cleaned voice prompt can be saved."
+
+        prompt = runtime.model.create_voice_clone_prompt(  # type: ignore[union-attr]
+            (prepared_state["waveform"], runtime.model.sampling_rate),  # type: ignore[union-attr]
+            ref_text=prepared_state["ref_text"],
+            language=prepared_state.get("language"),
+            preprocess_prompt=False,
+        )
+        profile = runtime.voice_library.create_profile(
+            name=voice_name.strip(),
+            cleaned_audio=prepared_state["waveform"],
+            sample_rate=runtime.model.sampling_rate,  # type: ignore[union-attr]
+            prompt=prompt,
+            transcript=prepared_state["ref_text"],
+            language=prepared_state.get("language"),
+            notes=notes or "",
+            metadata={"reference_report": prepared_state["report"]},
+        )
+        choices = _voice_choices(runtime.voice_library)
+        return (
+            gr.update(choices=choices, value=profile.id),
+            _format_profile(profile),
+            _wave_to_numpy(prepared_state["waveform"], runtime.model.sampling_rate),  # type: ignore[union-attr]
+            f"Saved voice profile `{profile.display_name}`.",
         )
 
-        if speed is not None and float(speed) != 1.0:
-            kw["speed"] = float(speed)
-        if duration is not None and float(duration) > 0:
-            kw["duration"] = float(duration)
+    def refresh_profiles(selected_id=None):
+        choices = _voice_choices(runtime.voice_library)
+        if not choices:
+            return gr.update(choices=[], value=None), "No saved voices yet.", None
+        current = selected_id if any(value == selected_id for _, value in choices) else choices[0][1]
+        profile = runtime.voice_library.find_profile(current)
+        ref_audio = runtime.voice_library.load_reference_audio(profile.id)
+        return gr.update(choices=choices, value=current), _format_profile(profile), _wave_to_numpy(ref_audio[0], ref_audio[1])
 
-        if mode == "clone":
-            if not ref_audio:
-                return None, "Please upload a reference audio."
-            kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-            )
+    def load_profile_details(profile_id):
+        if not profile_id:
+            return "Select a saved voice profile.", None
+        profile = runtime.voice_library.find_profile(profile_id)
+        waveform, sample_rate = runtime.voice_library.load_reference_audio(profile.id)
+        return _format_profile(profile), _wave_to_numpy(waveform, sample_rate)
 
-        if instruct and instruct.strip():
-            kw["instruct"] = instruct.strip()
+    def generate_from_profile(profile_id, text, language, num_step, guidance_scale, denoise, speed, duration, postprocess_output):
+        if not profile_id:
+            return None, "Choose a saved voice profile first."
+        if not text or not text.strip():
+            return None, "Enter text to synthesize."
+        prompt = runtime.voice_library.load_prompt(profile_id)
+        audio = runtime.model.generate(  # type: ignore[union-attr]
+            text=text.strip(),
+            language=_normalize_language(language),
+            voice_clone_prompt=prompt,
+            speed=float(speed or 1.0),
+            duration=float(duration) if duration else None,
+            generation_config=OmniVoiceGenerationConfig(
+                num_step=int(num_step or 32),
+                guidance_scale=float(guidance_scale or 2.0),
+                denoise=bool(denoise),
+                postprocess_output=bool(postprocess_output),
+            ),
+        )[0]
+        return _wave_to_numpy(audio, runtime.model.sampling_rate), "Generated from the saved voice profile."  # type: ignore[union-attr]
 
-        try:
-            audio = model.generate(**kw)
-        except Exception as e:
-            return None, f"Error: {type(e).__name__}: {e}"
+    def rename_profile(profile_id, new_name):
+        if not profile_id or not new_name.strip():
+            return gr.update(), gr.update(), "Choose a profile and enter a new name."
+        profile = runtime.voice_library.rename_profile(profile_id, new_name.strip())
+        choices = _voice_choices(runtime.voice_library)
+        return gr.update(choices=choices, value=profile.id), _format_profile(profile), "Voice renamed."
 
-        waveform = audio[0].squeeze(0).numpy()  # (T,)
-        waveform = (waveform * 32767).astype(np.int16)
-        return (sampling_rate, waveform), "Done."
+    def delete_profile(profile_id):
+        if not profile_id:
+            return gr.update(), "Choose a profile to delete.", None
+        runtime.voice_library.delete_profile(profile_id)
+        return refresh_profiles()
 
-    # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
-    _gen = generate_fn if generate_fn is not None else _gen_core
-
-    # =====================================================================
-    # UI
-    # =====================================================================
-    theme = gr.themes.Soft(
-        font=["Inter", "Arial", "sans-serif"],
-    )
-    css = """
-    .gradio-container {max-width: 100% !important; font-size: 16px !important;}
-    .gradio-container h1 {font-size: 1.5em !important;}
-    .gradio-container .prose {font-size: 1.1em !important;}
-    .compact-audio audio {height: 60px !important;}
-    .compact-audio .waveform {min-height: 80px !important;}
-    """
-
-    # Reusable: language dropdown component
-    def _lang_dropdown(label="Language (optional) / 语种 (可选)", value="Auto"):
-        return gr.Dropdown(
-            label=label,
-            choices=_ALL_LANGUAGES,
-            value=value,
-            allow_custom_value=False,
-            interactive=True,
-            info="Keep as Auto to auto-detect the language.",
+    def export_profile(profile_id):
+        if not profile_id:
+            return None, "Choose a profile to export."
+        path = runtime.voice_library.export_profile(
+            profile_id, runtime.voice_library.root_dir / f"{profile_id}.zip"
         )
+        return str(path), "Exported voice profile."
 
-    # Reusable: optional generation settings accordion
-    def _gen_settings():
-        with gr.Accordion("Generation Settings (optional)", open=False):
-            sp = gr.Slider(
-                0.5,
-                1.5,
-                value=1.0,
-                step=0.05,
-                label="Speed",
-                info="1.0 = normal. >1 faster, <1 slower. Ignored if Duration is set.",
-            )
-            du = gr.Number(
-                value=None,
-                label="Duration (seconds)",
-                info=(
-                    "Leave empty to use speed."
-                    " Set a fixed duration to override speed."
-                ),
-            )
-            ns = gr.Slider(
-                4,
-                64,
-                value=32,
-                step=1,
-                label="Inference Steps",
-                info="Default: 32. Lower = faster, higher = better quality.",
-            )
-            dn = gr.Checkbox(
-                label="Denoise",
-                value=True,
-                info="Default: enabled. Uncheck to disable denoising.",
-            )
-            gs = gr.Slider(
-                0.0,
-                4.0,
-                value=2.0,
-                step=0.1,
-                label="Guidance Scale (CFG)",
-                info="Default: 2.0.",
-            )
-            pp = gr.Checkbox(
-                label="Preprocess Prompt",
-                value=True,
-                info="apply silence removal and trimming to the reference "
-                "audio, add punctuation in the end of reference text (if not already)",
-            )
-            po = gr.Checkbox(
-                label="Postprocess Output",
-                value=True,
-                info="Remove long silences from generated audio.",
-            )
-        return ns, gs, dn, sp, du, pp, po
+    def import_profile(archive):
+        if not archive:
+            return gr.update(), "Choose a `.zip` voice profile export to import.", None
+        profile = runtime.voice_library.import_profile(archive)
+        dropdown, details, ref_audio = refresh_profiles(profile.id)
+        return dropdown, f"Imported `{profile.display_name}`.\n\n{details}", ref_audio
 
-    with gr.Blocks(theme=theme, css=css, title="OmniVoice Demo") as demo:
+    def reload_backend(device_override, asr_enabled):
+        runtime.reload(device_override, load_asr=bool(asr_enabled))
+        dropdown, details, ref_audio = refresh_profiles()
+        return runtime.summarize_runtime(), dropdown, details, ref_audio
+
+    def benchmark_backend():
+        start = time.perf_counter()
+        audio = runtime.model.generate(  # type: ignore[union-attr]
+            text="This is a short backend benchmark for OmniVoice.",
+            generation_config=OmniVoiceGenerationConfig(num_step=8, guidance_scale=1.5),
+        )[0]
+        elapsed = time.perf_counter() - start
+        return _wave_to_numpy(audio, runtime.model.sampling_rate), f"Completed benchmark in {elapsed:.2f}s."  # type: ignore[union-attr]
+
+    def _build_instruct(groups):
+        selected = [g for g in groups if g and g != "Auto"]
+        if not selected:
+            return None
+        parts = []
+        for value in selected:
+            if " / " in value:
+                en, zh = value.split(" / ", 1)
+                parts.append(zh.strip() if "Dialect" in en else en.strip())
+            else:
+                parts.append(value)
+        return ", ".join(parts)
+
+    def generate_designed_voice(text, language, num_step, guidance_scale, denoise, speed, duration, postprocess_output, *groups):
+        if not text or not text.strip():
+            return None, "Enter text to synthesize."
+        audio = runtime.model.generate(  # type: ignore[union-attr]
+            text=text.strip(),
+            language=_normalize_language(language),
+            instruct=_build_instruct(groups),
+            speed=float(speed or 1.0),
+            duration=float(duration) if duration else None,
+            generation_config=OmniVoiceGenerationConfig(
+                num_step=int(num_step or 32),
+                guidance_scale=float(guidance_scale or 2.0),
+                denoise=bool(denoise),
+                postprocess_output=bool(postprocess_output),
+            ),
+        )[0]
+        return _wave_to_numpy(audio, runtime.model.sampling_rate), "Generated with voice design."  # type: ignore[union-attr]
+
+    with gr.Blocks(theme=theme, css=css, title="OmniVoice Mac Demo") as demo:
+        prepared_state = gr.State(None)
+
         gr.Markdown(
             """
-# OmniVoice Demo
+<div class="hero">
 
-State-of-the-art text-to-speech model for **600+ languages**, supporting:
+# OmniVoice for macOS
 
-- **Voice Clone** — Clone any voice from a reference audio
-- **Voice Design** — Create custom voices with speaker attributes
+Clone a voice from a short clean clip, save it locally as a reusable profile, and come back later without re-uploading the reference audio.
 
-Built with [OmniVoice](https://github.com/k2-fsa/OmniVoice)
-by Xiaomi AI Lab Next-gen Kaldi team.
+</div>
 """
         )
 
+        runtime_markdown = gr.Markdown(runtime.summarize_runtime())
+
         with gr.Tabs():
-            # ==============================================================
-            # Voice Clone
-            # ==============================================================
             with gr.TabItem("Voice Clone"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        vc_text = gr.Textbox(
-                            label="Text to Synthesize / 待合成文本",
-                            lines=4,
-                            placeholder="Enter the text you want to synthesize...",
-                        )
-                        vc_ref_audio = gr.Audio(
-                            label="Reference Audio / 参考音频",
-                            type="filepath",
-                            elem_classes="compact-audio",
-                        )
+                        clone_text = gr.Textbox(label="Text to Synthesize", lines=4)
+                        ref_audio = gr.Audio(label="Reference Audio", type="filepath")
                         gr.Markdown(
-                            "<span style='font-size:0.85em;color:#888;'>"
-                            "Recommended: 3–10 seconds audio. "
-                            "</span>"
+                            "Use a clean **3-10 second** single-speaker clip. Avoid echo, music, clipping, and long pauses."
                         )
-                        vc_ref_text = gr.Textbox(
-                            label=("Reference Text (optional)" " / 参考音频文本（可选）"),
-                            lines=2,
-                            placeholder="Transcript of the reference audio. Leave empty"
-                            " to auto-transcribe via ASR models.",
+                        ref_text = gr.Textbox(
+                            label="Reference Transcript",
+                            lines=3,
+                            placeholder="Manual transcript is best. Leave blank to auto-transcribe if ASR is enabled.",
                         )
-                        vc_lang = _lang_dropdown("Language (optional) / 语种 (可选)")
-                        with gr.Accordion("Instruct (optional)", open=False):
-                            vc_instruct = gr.Textbox(label="Instruct", lines=2)
-                        (
-                            vc_ns,
-                            vc_gs,
-                            vc_dn,
-                            vc_sp,
-                            vc_du,
-                            vc_pp,
-                            vc_po,
-                        ) = _gen_settings()
-                        vc_btn = gr.Button("Generate / 生成", variant="primary")
+                        clone_lang = _lang_dropdown()
+                        auto_transcribe = gr.Checkbox(
+                            label="Auto transcribe when transcript is blank",
+                            value=runtime.load_asr,
+                        )
+                        voice_name = gr.Textbox(label="Voice Profile Name", placeholder="Narrator A")
+                        voice_notes = gr.Textbox(label="Notes (optional)", lines=2)
+                        with gr.Accordion("Advanced Generation Controls", open=False):
+                            clone_instruct = gr.Textbox(label="Optional Voice Instruction", lines=2)
+                            clone_num_step = gr.Slider(4, 64, value=32, step=1, label="Inference Steps")
+                            clone_guidance = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="Guidance Scale")
+                            clone_denoise = gr.Checkbox(label="Denoise", value=True)
+                            clone_speed = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Speed")
+                            clone_duration = gr.Number(value=None, label="Fixed Duration (seconds)")
+                            clone_preprocess = gr.Checkbox(label="Preprocess Reference", value=True)
+                            clone_postprocess = gr.Checkbox(label="Postprocess Output", value=True)
+                        with gr.Row():
+                            analyze_btn = gr.Button("Analyze Reference")
+                            save_btn = gr.Button("Save Voice Profile", variant="secondary")
+                            clone_btn = gr.Button("Generate Once", variant="primary")
                     with gr.Column(scale=1):
-                        vc_audio = gr.Audio(
-                            label="Output Audio / 合成结果",
-                            type="numpy",
+                        cleaned_ref_audio = gr.Audio(label="Cleaned Reference Preview", type="numpy")
+                        preprocess_report = gr.Markdown("Analyze a clip to see preprocessing details and warnings.")
+                        clone_output = gr.Audio(label="Generated Audio", type="numpy")
+                        clone_status = gr.Textbox(label="Status", lines=3)
+
+            with gr.TabItem("Saved Voices"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        voice_dropdown = gr.Dropdown(
+                            label="Saved Voice Profiles",
+                            choices=_voice_choices(runtime.voice_library),
+                            value=_voice_choices(runtime.voice_library)[0][1] if _voice_choices(runtime.voice_library) else None,
                         )
-                        vc_status = gr.Textbox(label="Status / 状态", lines=2)
+                        refresh_btn = gr.Button("Refresh Voices")
+                        saved_voice_text = gr.Textbox(label="Text to Synthesize", lines=4)
+                        saved_voice_lang = _lang_dropdown()
+                        rename_value = gr.Textbox(label="Rename Selected Voice")
+                        import_file = gr.File(label="Import Voice Profile (.zip)", type="filepath")
+                        with gr.Accordion("Advanced Generation Controls", open=False):
+                            saved_num_step = gr.Slider(4, 64, value=32, step=1, label="Inference Steps")
+                            saved_guidance = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="Guidance Scale")
+                            saved_denoise = gr.Checkbox(label="Denoise", value=True)
+                            saved_speed = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Speed")
+                            saved_duration = gr.Number(value=None, label="Fixed Duration (seconds)")
+                            saved_postprocess = gr.Checkbox(label="Postprocess Output", value=True)
+                        with gr.Row():
+                            generate_saved_btn = gr.Button("Generate From Saved Voice", variant="primary")
+                            rename_btn = gr.Button("Rename")
+                            delete_btn = gr.Button("Delete")
+                            export_btn = gr.Button("Export")
+                            import_btn = gr.Button("Import")
+                    with gr.Column(scale=1):
+                        profile_details = gr.Markdown("No saved voices yet.")
+                        profile_reference_audio = gr.Audio(label="Saved Reference Preview", type="numpy")
+                        saved_voice_output = gr.Audio(label="Generated Audio", type="numpy")
+                        saved_status = gr.Textbox(label="Status", lines=3)
+                        export_file = gr.File(label="Exported Voice Archive")
 
-                def _clone_fn(
-                    text, lang, ref_aud, ref_text, instruct, ns, gs, dn, sp, du, pp, po
-                ):
-                    return _gen(
-                        text,
-                        lang,
-                        ref_aud,
-                        instruct,
-                        ns,
-                        gs,
-                        dn,
-                        sp,
-                        du,
-                        pp,
-                        po,
-                        mode="clone",
-                        ref_text=ref_text or None,
-                    )
 
-                vc_btn.click(
-                    _clone_fn,
-                    inputs=[
-                        vc_text,
-                        vc_lang,
-                        vc_ref_audio,
-                        vc_ref_text,
-                        vc_instruct,
-                        vc_ns,
-                        vc_gs,
-                        vc_dn,
-                        vc_sp,
-                        vc_du,
-                        vc_pp,
-                        vc_po,
-                    ],
-                    outputs=[vc_audio, vc_status],
-                )
-
-            # ==============================================================
-            # Voice Design
-            # ==============================================================
             with gr.TabItem("Voice Design"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        vd_text = gr.Textbox(
-                            label="Text to Synthesize / 待合成文本",
-                            lines=4,
-                            placeholder="Enter the text you want to synthesize...",
-                        )
-                        vd_lang = _lang_dropdown()
-
-                        _AUTO = "Auto"
-                        vd_groups = []
-                        for _cat, _choices in _CATEGORIES.items():
-                            vd_groups.append(
-                                gr.Dropdown(
-                                    label=_cat,
-                                    choices=[_AUTO] + _choices,
-                                    value=_AUTO,
-                                    info=_ATTR_INFO.get(_cat),
-                                )
+                        design_text = gr.Textbox(label="Text to Synthesize", lines=4)
+                        design_lang = _lang_dropdown()
+                        design_groups = [
+                            gr.Dropdown(
+                                label=category,
+                                choices=["Auto"] + choices,
+                                value="Auto",
+                                info=_ATTR_INFO.get(category),
                             )
-
-                        (
-                            vd_ns,
-                            vd_gs,
-                            vd_dn,
-                            vd_sp,
-                            vd_du,
-                            vd_pp,
-                            vd_po,
-                        ) = _gen_settings()
-                        vd_btn = gr.Button("Generate / 生成", variant="primary")
+                            for category, choices in _CATEGORIES.items()
+                        ]
+                        with gr.Accordion("Advanced Generation Controls", open=False):
+                            design_num_step = gr.Slider(4, 64, value=32, step=1, label="Inference Steps")
+                            design_guidance = gr.Slider(0.0, 4.0, value=2.0, step=0.1, label="Guidance Scale")
+                            design_denoise = gr.Checkbox(label="Denoise", value=True)
+                            design_speed = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Speed")
+                            design_duration = gr.Number(value=None, label="Fixed Duration (seconds)")
+                            design_postprocess = gr.Checkbox(label="Postprocess Output", value=True)
+                        design_btn = gr.Button("Generate Designed Voice", variant="primary")
                     with gr.Column(scale=1):
-                        vd_audio = gr.Audio(
-                            label="Output Audio / 合成结果",
-                            type="numpy",
-                        )
-                        vd_status = gr.Textbox(label="Status / 状态", lines=2)
-
-                def _build_instruct(groups):
-                    """Extract instruct text from UI dropdowns.
-
-                    Language unification and validation is handled by
-                    _resolve_instruct inside _preprocess_all.
-                    """
-                    selected = [g for g in groups if g and g != "Auto"]
-                    if not selected:
-                        return None
-                    parts = []
-                    for v in selected:
-                        if " / " in v:
-                            en, zh = v.split(" / ", 1)
-                            # Dialects have no English equivalent
-                            if "Dialect" in v.split(" / ")[0]:
-                                parts.append(zh.strip())
-                            else:
-                                parts.append(en.strip())
-                        else:
-                            parts.append(v)
-                    return ", ".join(parts)
-
-                def _design_fn(text, lang, ns, gs, dn, sp, du, pp, po, *groups):
-                    return _gen(
-                        text,
-                        lang,
-                        None,
-                        _build_instruct(groups),
-                        ns,
-                        gs,
-                        dn,
-                        sp,
-                        du,
-                        pp,
-                        po,
-                        mode="design",
-                    )
-
-                vd_btn.click(
-                    _design_fn,
+                        design_audio = gr.Audio(label="Output Audio", type="numpy")
+                        design_status = gr.Textbox(label="Status", lines=2)
+                design_btn.click(
+                    generate_designed_voice,
                     inputs=[
-                        vd_text,
-                        vd_lang,
-                        vd_ns,
-                        vd_gs,
-                        vd_dn,
-                        vd_sp,
-                        vd_du,
-                        vd_pp,
-                        vd_po,
+                        design_text,
+                        design_lang,
+                        design_num_step,
+                        design_guidance,
+                        design_denoise,
+                        design_speed,
+                        design_duration,
+                        design_postprocess,
                     ]
-                    + vd_groups,
-                    outputs=[vd_audio, vd_status],
+                    + design_groups,
+                    outputs=[design_audio, design_status],
                 )
 
+            with gr.TabItem("Diagnostics / Settings"):
+                backend_override = gr.Dropdown(
+                    label="Backend Override",
+                    choices=["auto"] + available_backends(),
+                    value="auto",
+                )
+                asr_toggle = gr.Checkbox(label="Enable ASR auto transcription", value=runtime.load_asr)
+                diagnostics_btn = gr.Button("Reload Backend / Apply Settings")
+                benchmark_btn = gr.Button("Quick Benchmark")
+                benchmark_audio = gr.Audio(label="Benchmark Output", type="numpy")
+                benchmark_status = gr.Textbox(label="Benchmark Status", lines=2)
+                diagnostics_raw = gr.Code(
+                    value=json.dumps(runtime.runtime_info, indent=2),
+                    label="Raw Runtime Metadata",
+                    language="json",
+                )
+
+        analyze_btn.click(
+            prepare_reference,
+            inputs=[ref_audio, ref_text, clone_lang, clone_preprocess, auto_transcribe],
+            outputs=[prepared_state, cleaned_ref_audio, preprocess_report],
+        ).then(
+            lambda state: state["ref_text"] if state else gr.update(),
+            inputs=[prepared_state],
+            outputs=[ref_text],
+        )
+        save_btn.click(
+            save_voice_profile,
+            inputs=[prepared_state, voice_name, voice_notes],
+            outputs=[voice_dropdown, profile_details, profile_reference_audio, clone_status],
+        )
+        clone_btn.click(
+            clone_once,
+            inputs=[
+                clone_text,
+                clone_lang,
+                ref_audio,
+                ref_text,
+                clone_instruct,
+                clone_num_step,
+                clone_guidance,
+                clone_denoise,
+                clone_speed,
+                clone_duration,
+                clone_preprocess,
+                clone_postprocess,
+            ],
+            outputs=[clone_output, clone_status],
+        )
+        voice_dropdown.change(load_profile_details, inputs=[voice_dropdown], outputs=[profile_details, profile_reference_audio])
+        refresh_btn.click(refresh_profiles, inputs=[voice_dropdown], outputs=[voice_dropdown, profile_details, profile_reference_audio])
+        generate_saved_btn.click(
+            generate_from_profile,
+            inputs=[
+                voice_dropdown,
+                saved_voice_text,
+                saved_voice_lang,
+                saved_num_step,
+                saved_guidance,
+                saved_denoise,
+                saved_speed,
+                saved_duration,
+                saved_postprocess,
+            ],
+            outputs=[saved_voice_output, saved_status],
+        )
+        rename_btn.click(
+            rename_profile,
+            inputs=[voice_dropdown, rename_value],
+            outputs=[voice_dropdown, profile_details, saved_status],
+        )
+        delete_btn.click(delete_profile, inputs=[voice_dropdown], outputs=[voice_dropdown, profile_details, profile_reference_audio])
+        export_btn.click(export_profile, inputs=[voice_dropdown], outputs=[export_file, saved_status])
+        import_btn.click(import_profile, inputs=[import_file], outputs=[voice_dropdown, profile_details, profile_reference_audio])
+        diagnostics_btn.click(
+            reload_backend,
+            inputs=[backend_override, asr_toggle],
+            outputs=[runtime_markdown, voice_dropdown, profile_details, profile_reference_audio],
+        ).then(
+            lambda: json.dumps(runtime.runtime_info, indent=2),
+            outputs=[diagnostics_raw],
+        )
+        benchmark_btn.click(benchmark_backend, outputs=[benchmark_audio, benchmark_status])
+        demo.load(refresh_profiles, outputs=[voice_dropdown, profile_details, profile_reference_audio])
+
     return demo
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 
 def main(argv=None) -> int:
@@ -512,23 +620,15 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    device = args.device or get_best_device()
-
-    checkpoint = args.model
-    if not checkpoint:
-        parser.print_help()
-        return 0
-    logging.info(f"Loading model from {checkpoint}, device={device} ...")
-    model = OmniVoice.from_pretrained(
-        checkpoint,
-        device_map=device,
-        dtype=torch.float16,
+    runtime = AppRuntime(
+        checkpoint=args.model,
+        device=args.device,
         load_asr=not args.no_asr,
+        voices_dir=args.voices_dir,
     )
-    print("Model loaded.")
+    logger.info("Runtime info: %s", json.dumps(runtime.runtime_info, indent=2))
 
-    demo = build_demo(model, checkpoint)
-
+    demo = build_demo(runtime)
     demo.queue().launch(
         server_name=args.ip,
         server_port=args.port,

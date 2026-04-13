@@ -23,6 +23,7 @@ from omnivoice.models.omnivoice import (
     OmniVoice,
     OmniVoiceConfig,
     OmniVoiceGenerationConfig,
+    VoiceClonePrompt,
 )
 
-__all__ = ["OmniVoice", "OmniVoiceConfig", "OmniVoiceGenerationConfig"]
+__all__ = ["OmniVoice", "OmniVoiceConfig", "OmniVoiceGenerationConfig", "VoiceClonePrompt"]

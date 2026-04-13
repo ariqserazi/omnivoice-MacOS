@@ -16,6 +16,13 @@
 
 OmniVoice is a state-of-the-art massively multilingual zero-shot text-to-speech (TTS) model supporting over 600 languages. Built on a novel diffusion language model-style architecture, it generates high-quality speech with superior inference speed, supporting voice cloning and voice design.
 
+This repository also includes a **Mac-first local voice cloning workflow** with:
+
+- saved reusable voice profiles
+- reference-audio preprocessing and warnings
+- MPS vs CPU backend diagnostics and fallback
+- a Gradio app tuned for repeated everyday use on Apple Silicon
+
 **Contents**: [Key Features](#key-features) | [Installation](#installation) | [Quick Start](#quick-start) | [Python API](#python-api) | [Command-Line Tools](#command-line-tools) | [Training & Evaluation](#training--evaluation) | [Discussion](#discussion--communication) | [Citation](#citation)
 
 ## Key Features
@@ -57,6 +64,12 @@ pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --extra-index-url https:/
 pip install torch==2.8.0 torchaudio==2.8.0
 ```
 
+For the improved local workflow in this repo, we recommend:
+
+```bash
+pip install -e ".[dev]"
+```
+
 </details>
 
 **Step 2**: Install OmniVoice (choose one)
@@ -92,7 +105,25 @@ uv sync
 
 Try OmniVoice without coding:
 
-- Launch the local web UI: `omnivoice-demo --ip 0.0.0.0 --port 8001`
+- Launch the local web UI: `omnivoice-demo --device auto --ip 0.0.0.0 --port 8001`
+
+- Create a reusable saved voice from the CLI:
+
+```bash
+omnivoice-voices create \
+  --name "Narrator A" \
+  --ref-audio ref.wav \
+  --ref-text "Reference transcript"
+```
+
+- Reuse a saved voice later without re-uploading the clip:
+
+```bash
+omnivoice-infer \
+  --voice "Narrator A" \
+  --text "Welcome back." \
+  --output out.wav
+```
 
 
 - Or try it directly on [HuggingFace Space](https://huggingface.co/spaces/k2-fsa/OmniVoice)
@@ -100,6 +131,8 @@ Try OmniVoice without coding:
 > If you have trouble connecting to HuggingFace when downloading the pre-trained models, set `export HF_ENDPOINT="https://hf-mirror.com"` before running.
 
 For full usage, see the [Python API](#python-api) and [Command-Line Tools](#command-line-tools) sections below.
+
+For the full macOS workflow, backend troubleshooting, and saved-voice details, see [docs/mac-voice-workflow.md](docs/mac-voice-workflow.md).
 
 ---
 
@@ -137,7 +170,9 @@ torchaudio.save("out.wav", audio[0], 24000)
 
 > **Tips**
 >
-> - Use a 3–10 seconds reference audio clip. Longer audio slows down inference and may degrade cloning quality.
+> - Use a clean **3-10 second** single-speaker reference clip.
+> - Avoid background music, room echo, clipped recordings, and long dead air.
+> - An accurate transcript matters. Mismatched transcripts can reduce voice similarity and stability.
 > - For better results with Arabic numerals, normalize them to words first (e.g., "123" → "one hundred twenty-three") with text normalization tools (e.g., [WeTextProcessing](https://github.com/wenet-e2e/WeTextProcessing)).
 
 ### Voice Design
@@ -209,21 +244,30 @@ audio = model.generate(text="He plays the [B EY1 S] guitar while catching a [B A
 
 ## Command-Line Tools
 
-Three CLI entry points are provided. The CLI tools support all features available in the Python API (voice cloning, voice design, auto voice, generation parameters, etc.) — all controlled via command-line arguments.
+Five CLI entry points are provided. The CLI tools support all features available in the Python API plus saved voice profile workflows and Mac backend diagnostics.
 
 | Command | Description | Source |
 |---|---|---|
 | `omnivoice-demo` | Interactive Gradio web demo | [omnivoice/cli/demo.py](omnivoice/cli/demo.py) |
 | `omnivoice-infer` | Single-item inference | [omnivoice/cli/infer.py](omnivoice/cli/infer.py) |
 | `omnivoice-infer-batch` | Batch inference across multiple GPUs | [omnivoice/cli/infer_batch.py](omnivoice/cli/infer_batch.py) |
+| `omnivoice-voices` | Create, list, rename, delete, export, and import saved voice profiles | [omnivoice/cli/voices.py](omnivoice/cli/voices.py) |
+| `omnivoice-diagnose-mac` | Run the Apple Silicon backend sanity check | [omnivoice/cli/diagnose_mac.py](omnivoice/cli/diagnose_mac.py) |
 
 ### Demo
 
 ```bash
-omnivoice-demo --ip 0.0.0.0 --port 8001
+omnivoice-demo --device auto --ip 0.0.0.0 --port 8001
 ```
 
-Provides a web UI for voice cloning and voice design. See `omnivoice-demo --help` for all options.
+Provides a web UI with four sections:
+
+- `Voice Clone`: analyze a reference clip, edit the transcript, save a reusable voice profile, or generate a one-off sample
+- `Saved Voices`: browse local voices, preview metadata, rename/delete, export/import, and generate from a saved profile
+- `Voice Design`: create prompt-based voices without a reference clip
+- `Diagnostics / Settings`: inspect the active backend, switch MPS vs CPU, and run a quick benchmark
+
+Saved voices default to `~/Library/Application Support/OmniVoice/voices` on macOS. Override this with `--voices-dir` or `OMNIVOICE_VOICES_DIR`.
 
 ### Single Inference
 
@@ -248,7 +292,63 @@ omnivoice-infer \
     --model k2-fsa/OmniVoice \
     --text "This is a test for text to speech."\
     --output hello.wav
+
+# Reuse a saved voice profile
+omnivoice-infer \
+    --voice "Narrator A" \
+    --text "This uses the saved voice profile." \
+    --device auto \
+    --output narrator.wav
 ```
+
+`omnivoice-infer --device auto` prefers CUDA, then MPS, then CPU. On macOS it uses `float32` for MPS and CPU, runs an MPS sanity check, and falls back to CPU automatically if MPS output looks broken, silent, or non-finite.
+
+### Saved Voice Profiles
+
+```bash
+# Create and cache a reusable voice profile
+omnivoice-voices create \
+    --name "Narrator A" \
+    --ref-audio ref.wav \
+    --ref-text "Reference transcript"
+
+# List saved voices
+omnivoice-voices list
+
+# Generate from a saved voice
+omnivoice-voices generate \
+    --voice "Narrator A" \
+    --text "Welcome back." \
+    --output welcome.wav
+
+# Rename, export, import, delete
+omnivoice-voices rename --voice "Narrator A" --new-name "Narrator Warm"
+omnivoice-voices export --voice "Narrator Warm" --output narrator-warm.zip
+omnivoice-voices import --archive narrator-warm.zip
+omnivoice-voices delete --voice "Narrator Warm"
+```
+
+Each saved voice profile stores:
+
+- cleaned reference audio
+- approved transcript
+- cached reusable `VoiceClonePrompt` conditioning tokens
+- reference RMS and metadata
+- schema and app version metadata
+
+### Apple Silicon Diagnostics
+
+```bash
+omnivoice-diagnose-mac --device auto
+```
+
+Use this if MPS sounds noisy, silent, or unstable. The diagnostic result is cached locally and `--device auto` will prefer CPU automatically when a previous MPS check failed.
+
+### Limitations
+
+- Saved voice profiles reuse the model's real voice clone prompt representation, but they do not magically bypass the model's intrinsic speaker drift limits.
+- Very long passages can still vary slightly across chunks, although the same saved conditioning is now reused across chunked generation.
+- Poor reference audio or inaccurate transcripts will still hurt quality even with preprocessing and warnings.
 
 ### Batch Inference
 
